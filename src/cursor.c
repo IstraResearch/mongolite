@@ -136,6 +136,7 @@ void fill_as_missing(SEXP vec, int row);
 SEXP add_new_column(SEXP list, bson_iter_t *iter, int index, int n, int na_rows);
 SEXP shrink_columns(SEXP list, int new_rows);
 SEXP ConvertArray(bson_iter_t* iter, bson_iter_t* counter);
+void init_col_with_na(SEXP new_elt, int n);
 
 void R_heterogenous_column_error(bson_iter_t *iter, SEXP col, int row);
 char* bson_type2char(bson_type_t t);
@@ -174,6 +175,7 @@ SEXP R_mongo_cursor_next_page_flattened(SEXP ptr, SEXP size) {
   for (int i = 0; bson_iter_next(&iter); i++) {
     SET_STRING_ELT(names, i, Rf_mkChar(bson_iter_key_unsafe(&iter)));
     PROTECT_WITH_INDEX(col = alloc_for_bson_type(&iter, n), &col_index);
+    init_col_with_na(col, n);
     REPROTECT(col = insert_bson_type(col, &iter, 0), col_index);
     SET_VECTOR_ELT(ret, i, col);
     UNPROTECT(1);
@@ -190,49 +192,32 @@ SEXP R_mongo_cursor_next_page_flattened(SEXP ptr, SEXP size) {
     // new column; or (2) fewer entries than we have columns, which requires
     // that the remaining columns be filled with NAs.
     //
-    // We do rely on the order of bson entries matching the order of existing
-    // columns, which appears to be how mongo-c returns them to us.
     i = 0;
-    while (true) {
-      bool has_next = bson_iter_next(&iter);
-      if (!has_next) {
-        // Fill any remaining columns with NAs.
-        for (i = i; i < cols; i++) {
-          col = VECTOR_ELT(ret, i);
-          fill_as_missing(col, row);
-        }
-        break;
-      }
+    while (bson_iter_next(&iter)) {
       if (i >= cols) { // Yet i > cols should never happen.
         REPROTECT(ret = add_new_column(ret, &iter, i, n, row), ret_index);
         REPROTECT(names = Rf_getAttrib(ret, R_NamesSymbol), names_index);
         cols++;
       }
-      // Check that bson keys match the expected column name.
-      if (strcmp(CHAR(STRING_ELT(names, i)), bson_iter_key_unsafe(&iter)) != 0) {
-        int missing_column = 0, j = i;
-        while (j < cols) {
-          if (strcmp(CHAR(STRING_ELT(names, j)), bson_iter_key_unsafe(&iter)) == 0) {
-            missing_column = j;
+      int col_to_insert = i;
+      if (strcmp(CHAR(STRING_ELT(names, col_to_insert)), bson_iter_key_unsafe(&iter)) != 0) {
+        bool found_col = false;
+        for (col_to_insert = (col_to_insert + 1) % cols; col_to_insert != i; col_to_insert = (col_to_insert + 1) % cols) {
+          if (strcmp(CHAR(STRING_ELT(names, col_to_insert)), bson_iter_key_unsafe(&iter)) == 0) {
+            found_col = true;
             break;
           }
-          j++;
         }
-        if (missing_column > 0) {
-          // Fill in NAs and advance the index to that column before continuing.
-          for (i = i; i < missing_column; i++) {
-            col = VECTOR_ELT(ret, i);
-            fill_as_missing(col, row);
-          }
-        } else {
-          REPROTECT(ret = add_new_column(ret, &iter, i, n, row), ret_index);
+        if (!found_col) {
+          col_to_insert = cols;
+          REPROTECT(ret = add_new_column(ret, &iter, col_to_insert, n, row), ret_index);
           REPROTECT(names = Rf_getAttrib(ret, R_NamesSymbol), names_index);
           cols++;
         }
       }
-      PROTECT_WITH_INDEX(col = VECTOR_ELT(ret, i), &col_index);
+      PROTECT_WITH_INDEX(col = VECTOR_ELT(ret, col_to_insert), &col_index);
       REPROTECT(col = insert_bson_type(col, &iter, row), col_index);
-      SET_VECTOR_ELT(ret, i, col);
+      SET_VECTOR_ELT(ret, col_to_insert, col);
       UNPROTECT(1);
       i++;
     }
@@ -488,6 +473,19 @@ SEXP insert_bson_type(SEXP vec, bson_iter_t *iter, int row) {
   case BSON_TYPE_INT64: {
     if (Rf_isReal(vec)) {
       REAL(vec)[row] = (double) bson_iter_int64_unsafe(iter);
+    } else if (Rf_isInteger(vec)) {
+      vec = PROTECT(Rf_coerceVector(vec, REALSXP));
+      REAL(vec)[row] = (double) bson_iter_int64_unsafe(iter);
+      UNPROTECT(1);
+    } else if (Rf_isString(vec)) {
+      SEXP elt = PROTECT(Rf_ScalarInteger(bson_iter_int64_unsafe(iter)));
+      PROTECT(elt = Rf_asChar(elt));
+      SET_STRING_ELT(vec, row, elt);
+      UNPROTECT(2);
+    } else if (Rf_isLogical(vec)) {
+      vec = PROTECT(Rf_coerceVector(vec, REALSXP));
+      INTEGER(vec)[row] = bson_iter_int64_unsafe(iter);
+      UNPROTECT(1);
     } else {
       // TODO: Handle alternative represenations.
       R_heterogenous_column_error(iter, vec, row);
@@ -573,43 +571,7 @@ SEXP add_new_column(SEXP list, bson_iter_t *iter, int index, int n, int na_rows)
 
   // Fill all previous rows as missing.
   SEXP new_elt = PROTECT(alloc_for_bson_type(iter, n));
-  switch(TYPEOF(new_elt)) {
-  case LGLSXP: {
-    int *raw = LOGICAL(new_elt);
-    for (int i = 0; i < na_rows; i++) {
-      raw[i] = NA_LOGICAL;
-    }
-    break;
-  }
-  case INTSXP: {
-    int *raw = INTEGER(new_elt);
-    for (int i = 0; i < na_rows; i++) {
-      raw[i] = NA_INTEGER;
-    }
-    break;
-  }
-  case REALSXP: {
-    double *raw = REAL(new_elt);
-    for (int i = 0; i < na_rows; i++) {
-      raw[i] = NA_REAL;
-    }
-    break;
-  }
-  case STRSXP: {
-    for (int i = 0; i < na_rows; i++) {
-      SET_STRING_ELT(new_elt, i, NA_STRING);
-    }
-    break;
-  }
-  case VECSXP: {
-    for (int i = 0; i < na_rows; i++) {
-      SET_VECTOR_ELT(new_elt, i, R_NilValue);
-    }
-    break;
-  }
-  default:
-    stop("Can't fill vector of type %d as missing.");
-  }
+  init_col_with_na(new_elt, n);
 
   SEXP new_list = PROTECT(Rf_allocVector(VECSXP, size + 1));
   SET_VECTOR_ELT(new_list, index, new_elt);
@@ -624,6 +586,46 @@ SEXP add_new_column(SEXP list, bson_iter_t *iter, int index, int n, int na_rows)
   Rf_setAttrib(new_list, R_NamesSymbol, new_names);
   UNPROTECT(3);
   return new_list;
+}
+
+void init_col_with_na(SEXP new_elt, int n) {
+  switch(TYPEOF(new_elt)) {
+    case LGLSXP: {
+      int *raw = LOGICAL(new_elt);
+      for (int i = 0; i < n; i++) {
+        raw[i] = NA_LOGICAL;
+      }
+      break;
+    }
+    case INTSXP: {
+      int *raw = INTEGER(new_elt);
+      for (int i = 0; i < n; i++) {
+        raw[i] = NA_INTEGER;
+      }
+      break;
+    }
+    case REALSXP: {
+      double *raw = REAL(new_elt);
+      for (int i = 0; i < n; i++) {
+        raw[i] = NA_REAL;
+      }
+      break;
+    }
+    case STRSXP: {
+      for (int i = 0; i < n; i++) {
+        SET_STRING_ELT(new_elt, i, NA_STRING);
+      }
+      break;
+      }
+    case VECSXP: {
+      for (int i = 0; i < n; i++) {
+        SET_VECTOR_ELT(new_elt, i, R_NilValue);
+      }
+      break;
+    }
+    default:
+      stop("Can't fill vector of type %d as missing.");
+  }
 }
 
 SEXP shrink_columns(SEXP list, int new_rows) {

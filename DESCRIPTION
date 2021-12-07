@@ -5,6 +5,7 @@ Description: High-performance MongoDB client based on 'mongo-c-driver' and 'json
     Includes support for aggregation, indexing, map-reduce, streaming, encryption,
     enterprise authentication, and GridFS. The online user manual provides an overview 
     of the available methods in the package: <https://jeroen.github.io/mongolite/>.
+    Optimized istra version, based on atheriel/mongolite
 Version: 2.4.1
 Authors@R: c(
     person("Jeroen", "Ooms", ,"jeroen@berkeley.edu", role = c("aut", "cre"),
